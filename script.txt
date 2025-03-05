@@ -1,0 +1,144 @@
+import cv2
+import os
+import time
+import threading
+import datetime
+import numpy as np
+from pathlib import Path
+import RPi.GPIO as GPIO
+
+# ========================
+# Configurazione GPIO per i LED
+# ========================
+RED_PIN = 17
+YELLOW_PIN = 27
+GREEN_PIN = 22
+
+def setup_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(RED_PIN, GPIO.OUT)
+    GPIO.setup(YELLOW_PIN, GPIO.OUT)
+    GPIO.setup(GREEN_PIN, GPIO.OUT)
+    GPIO.output(RED_PIN, GPIO.LOW)
+    GPIO.output(YELLOW_PIN, GPIO.LOW)
+    GPIO.output(GREEN_PIN, GPIO.LOW)
+
+    # Test iniziale LED
+    for pin in [RED_PIN, YELLOW_PIN, GREEN_PIN]:
+        GPIO.output(pin, GPIO.HIGH)
+        time.sleep(1)
+        GPIO.output(pin, GPIO.LOW)
+
+# ========================
+# Funzioni per la gestione dei LED
+# ========================
+def set_led_state(red, yellow, green):
+    GPIO.output(RED_PIN, red)
+    GPIO.output(YELLOW_PIN, yellow)
+    GPIO.output(GREEN_PIN, green)
+
+# ========================
+# Funzione per eliminare file se lo spazio supera i 35GB
+# ========================
+def cleanup_old_files(directory, max_size_gb=35):
+    total_size = sum(f.stat().st_size for f in Path(directory).glob("*.h264")) / (1024 ** 3)
+    if total_size > max_size_gb:
+        files = sorted(Path(directory).glob("*.h264"), key=lambda f: f.stat().st_mtime)
+        files_to_delete = len(files) // 2
+        for file in files[:files_to_delete]:
+            file.unlink()
+
+# ========================
+# Funzione per la registrazione video
+# ========================
+def record_videos(directory):
+    while True:
+        cleanup_old_files(directory)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = os.path.join(directory, f"video_{timestamp}.h264")
+        os.system(f"libcamera-vid -t 10000 -o {filename} --flush")
+
+# ========================
+# Rilevamento dei pericoli
+# ========================
+def detect_dangers(video_source=0):
+    net = cv2.dnn.readNetFromCaffe(
+        'MobileNetSSD_deploy.prototxt', 
+        'MobileNetSSD_deploy.caffemodel'
+    )
+
+    CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
+               "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+               "dog", "horse", "motorbike", "person", "pottedplant",
+               "sheep", "sofa", "train", "tvmonitor"]
+
+    cap = cv2.VideoCapture(video_source)
+    previous_distances = {}
+    frame_time = 0.1
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        (h, w) = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+        net.setInput(blob)
+        detections = net.forward()
+
+        closest_distance = float('inf')
+        for i in np.arange(0, detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > 0.5:
+                idx = int(detections[0, 0, i, 1])
+                label = CLASSES[idx]
+
+                if label == "person" or label == "car":
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    (startX, startY, endX, endY) = box.astype("int")
+                    distance = w / (endX - startX)
+                    closest_distance = min(closest_distance, distance)
+
+        # Accensione progressiva dei LED in base alla distanza
+        if closest_distance < 3:  # Molto vicino
+            set_led_state(1, 1, 1)
+        elif closest_distance < 5:  # Medio vicino
+            set_led_state(0, 1, 1)
+        elif closest_distance < 8:  # Più lontano
+            set_led_state(0, 0, 1)
+        else:
+            set_led_state(0, 0, 0)
+
+        time.sleep(frame_time)
+
+    cap.release()
+
+# ========================
+# Avvio dello script
+# ========================
+def main():
+    try:
+        video_directory = "/home/genny/Videos"
+        os.makedirs(video_directory, exist_ok=True)
+
+        setup_gpio()
+        cleanup_old_files(video_directory)
+
+        video_thread = threading.Thread(target=record_videos, args=(video_directory,))
+        video_thread.daemon = True
+        video_thread.start()
+
+        ai_thread = threading.Thread(target=detect_dangers, args=(0,))
+        ai_thread.daemon = True
+        ai_thread.start()
+
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("Interrotto dall'utente")
+    finally:
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
